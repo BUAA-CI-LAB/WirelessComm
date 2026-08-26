@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wireless-comm"
+version = "0.1.0"
+description = "Structured point-to-point communication runtime for Wi-Fi networks"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "msgpack>=1.0",
+]
+
+[project.optional-dependencies]
+tensor = ["torch>=2.6"]
+test = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
