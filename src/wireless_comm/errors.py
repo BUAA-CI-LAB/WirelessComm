@@ -33,5 +33,9 @@ class MessageTooLargeError(CommError):
     """A message exceeds a configured resource limit."""
 
 
+class BackpressureError(CommError):
+    """A peer cannot accept another queued message within its limits."""
+
+
 class OperationTimeoutError(CommError):
     """A send or receive operation timed out."""

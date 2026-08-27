@@ -1,0 +1,44 @@
+controller: agx-orin
+base_port: 9600
+
+nodes:
+  - node_id: agx-orin
+    host: 192.0.2.101
+    ssh_alias: AgxOrin
+    interface: wlP1p1s0
+    workdir: /tmp/wireless_comm_cluster
+    python: /home/user/miniconda3/bin/python3
+    ranks: [0]
+
+  - node_id: agx-thor
+    host: 192.0.2.100
+    ssh_alias: AgxThor
+    interface: wlP1p1s0
+    workdir: /tmp/wireless_comm_cluster
+    python: /tmp/wireless_comm_test_20260827/.venv/bin/python
+    ranks: [1]
+
+  - node_id: agx-orin-2
+    host: 192.0.2.107
+    ssh_alias: AgxOrin_2
+    interface: wlP1p1s0
+    workdir: /tmp/wireless_comm_cluster
+    python: /usr/bin/python3
+    ranks: [2]
+
+  - node_id: orin-nx
+    host: 192.0.2.108
+    ssh_alias: OrinNx
+    interface: wlP1p1s0
+    workdir: /tmp/wireless_comm_cluster
+    python: /home/jetson/miniconda3/bin/python3
+    ranks: [3]
+
+ring: [0, 1, 2, 3]
+
+benchmark:
+  payload_sizes: [1024, 65536, 1048576]
+  rounds: 20
+  warmup_rounds: 3
+  collectives: [barrier, broadcast, allgather, ring_allreduce]
+  timeout: 120

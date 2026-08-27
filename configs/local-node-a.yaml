@@ -1,0 +1,13 @@
+local:
+  node_id: node-a
+  host: 127.0.0.1
+  port: 9201
+
+peers:
+  - node_id: node-b
+    host: 127.0.0.1
+    port: 9202
+
+comm:
+  max_peer_queued_messages: 1024
+  max_peer_queued_bytes: 134217728

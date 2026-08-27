@@ -7,9 +7,11 @@ name = "wireless-comm"
 version = "0.1.0"
 description = "Structured point-to-point communication runtime for Wi-Fi networks"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "msgpack>=1.0",
+    "PyYAML>=6.0",
+    "typing-extensions>=4.0",
 ]
 
 [project.optional-dependencies]

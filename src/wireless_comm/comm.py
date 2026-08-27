@@ -9,10 +9,13 @@ import uuid
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Self
+from typing import Any
+
+from typing_extensions import Self
 
 from .codec import CodecRegistry, EncodedPayload, PayloadCodec
 from .errors import (
+    BackpressureError,
     CommError,
     ConnectionClosedError,
     ConnectionFailedError,
@@ -27,6 +30,7 @@ from .protocol import (
     encode_frame,
     read_frame,
 )
+from .scheduler import ByteScheduler
 from .types import CommConfig, CommOptions, Metadata, Object, Peer, SendResult
 
 
@@ -48,9 +52,24 @@ class _Connection:
 
 
 @dataclass(slots=True)
+class _OutboundMessage:
+    frame: Frame
+    chunks: tuple[bytes | memoryview, ...]
+    wire_bytes: int
+    completion: asyncio.Future[SendResult]
+    active: bool = False
+
+
+@dataclass(slots=True)
 class _PeerState:
+    peer: Peer
     connections: dict[str, _Connection] = field(default_factory=dict)
     connect_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    queue: deque[_OutboundMessage] = field(default_factory=deque)
+    queue_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    pending_messages: int = 0
+    pending_bytes: int = 0
+    writer_task: asyncio.Task[None] | None = None
 
     def preferred(self) -> _Connection | None:
         if not self.connections:
@@ -85,7 +104,9 @@ class Comm:
         self._bind_host = bind_host
         self._directory = directory
         self._states = {
-            node_id: _PeerState() for node_id in directory if node_id != local.node_id
+            node_id: _PeerState(peer)
+            for node_id, peer in directory.items()
+            if node_id != local.node_id
         }
         self.registry = CodecRegistry()
         self._codec = PayloadCodec(self.registry, config)
@@ -96,6 +117,15 @@ class Comm:
         self._inbound_condition = asyncio.Condition()
         self._connection_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
+        self._byte_scheduler = (
+            ByteScheduler(
+                config.egress_quantum_bytes,
+                config.egress_rate_bytes_per_second,
+                config.egress_burst_bytes or config.egress_quantum_bytes,
+            )
+            if config.egress_quantum_bytes is not None
+            else None
+        )
 
     @classmethod
     async def create(
@@ -191,15 +221,19 @@ class Comm:
                     piggypayload,
                     dst,
                     operation_options.tag,
+                    operation_options.wait_for_capacity,
                 )
-            async with asyncio.timeout(operation_options.timeout):
-                return await self._send(
+            return await asyncio.wait_for(
+                self._send(
                     object,
                     piggypayload,
                     dst,
                     operation_options.tag,
-                )
-        except TimeoutError as exc:
+                    operation_options.wait_for_capacity,
+                ),
+                operation_options.timeout,
+            )
+        except asyncio.TimeoutError as exc:
             raise OperationTimeoutError(f"send to {dst.node_id!r} timed out") from exc
 
     async def recv(
@@ -217,12 +251,11 @@ class Comm:
                     src.node_id, operation_options.tag
                 )
             else:
-                async with asyncio.timeout(operation_options.timeout):
-                    message = await self._receive_matching(
-                        src.node_id,
-                        operation_options.tag,
-                    )
-        except TimeoutError as exc:
+                message = await asyncio.wait_for(
+                    self._receive_matching(src.node_id, operation_options.tag),
+                    operation_options.timeout,
+                )
+        except asyncio.TimeoutError as exc:
             raise OperationTimeoutError(
                 f"receive from {src.node_id!r} timed out"
             ) from exc
@@ -237,6 +270,26 @@ class Comm:
         self._closed = True
         if self._server is not None:
             self._server.close()
+
+        writer_tasks: list[asyncio.Task[None]] = []
+        for state in self._states.values():
+            async with state.queue_condition:
+                while state.queue:
+                    message = state.queue.popleft()
+                    state.pending_messages -= 1
+                    state.pending_bytes -= message.wire_bytes
+                    if not message.completion.done():
+                        message.completion.set_exception(
+                            ConnectionClosedError("Comm closed before message was sent")
+                        )
+                state.queue_condition.notify_all()
+            if state.writer_task is not None:
+                state.writer_task.cancel()
+                writer_tasks.append(state.writer_task)
+        if writer_tasks:
+            await asyncio.gather(*writer_tasks, return_exceptions=True)
+        if self._byte_scheduler is not None:
+            await self._byte_scheduler.close()
 
         connections = [
             connection
@@ -271,6 +324,7 @@ class Comm:
         piggypayload: Mapping[str, Any] | None,
         dst: Peer,
         tag: int,
+        wait_for_capacity: bool,
     ) -> SendResult:
         if self._closed:
             raise ConnectionClosedError("Comm is closed")
@@ -278,19 +332,168 @@ class Comm:
         message_id = self._allocate_message_id()
         frame = Frame(MessageKind.DATA, tag, message_id, payload)
         chunks = encode_frame(frame, self.config)
-        connection = await self._connection_for(dst)
+        wire_bytes = sum(len(chunk) for chunk in chunks)
+        completion = asyncio.get_running_loop().create_future()
+        message = _OutboundMessage(frame, chunks, wire_bytes, completion)
+        await self._enqueue(dst, message, wait_for_capacity)
+        try:
+            return await asyncio.shield(completion)
+        except asyncio.CancelledError:
+            removed = await self._remove_queued(dst.node_id, message)
+            if not removed and message.active:
+                await self._cancel_active_send(dst.node_id, message)
+            raise
 
-        async with connection.write_lock:
+    async def _enqueue(
+        self,
+        peer: Peer,
+        message: _OutboundMessage,
+        wait_for_capacity: bool,
+    ) -> None:
+        if message.wire_bytes > self.config.max_peer_queued_bytes:
+            raise BackpressureError(
+                "message is larger than the per-peer queued-byte limit"
+            )
+        state = self._states[peer.node_id]
+        async with state.queue_condition:
+            while self._queue_is_full(state, message.wire_bytes):
+                if not wait_for_capacity:
+                    raise BackpressureError(f"send queue for {peer.node_id!r} is full")
+                await state.queue_condition.wait()
+                if self._closed:
+                    raise ConnectionClosedError("Comm is closed")
+            state.queue.append(message)
+            state.pending_messages += 1
+            state.pending_bytes += message.wire_bytes
+            if state.writer_task is None or state.writer_task.done():
+                state.writer_task = asyncio.create_task(
+                    self._writer_loop(state),
+                    name=f"wireless-comm-tx-{peer.node_id}",
+                )
+            state.queue_condition.notify_all()
+
+    async def _remove_queued(
+        self,
+        peer_id: str,
+        message: _OutboundMessage,
+    ) -> bool:
+        state = self._states[peer_id]
+        async with state.queue_condition:
             try:
-                for chunk in chunks:
-                    connection.writer.write(chunk)
-                await connection.writer.drain()
-            except (ConnectionError, OSError) as exc:
-                await self._drop_connection(connection)
-                raise ConnectionClosedError(
-                    f"connection to {dst.node_id!r} failed during send"
-                ) from exc
-        return SendResult(message_id, sum(len(chunk) for chunk in chunks))
+                state.queue.remove(message)
+            except ValueError:
+                return False
+            state.pending_messages -= 1
+            state.pending_bytes -= message.wire_bytes
+            message.completion.cancel()
+            state.queue_condition.notify_all()
+            return True
+
+    async def _cancel_active_send(
+        self,
+        peer_id: str,
+        message: _OutboundMessage,
+    ) -> None:
+        state = self._states[peer_id]
+        writer_task = state.writer_task
+        if writer_task is None or not message.active:
+            return
+        writer_task.cancel()
+        await asyncio.gather(writer_task, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            await asyncio.shield(message.completion)
+        async with state.queue_condition:
+            if state.queue and not self._closed:
+                state.writer_task = asyncio.create_task(
+                    self._writer_loop(state),
+                    name=f"wireless-comm-tx-{peer_id}",
+                )
+
+    async def _writer_loop(self, state: _PeerState) -> None:
+        while True:
+            async with state.queue_condition:
+                while not state.queue:
+                    if self._closed:
+                        return
+                    await state.queue_condition.wait()
+                message = state.queue.popleft()
+                message.active = True
+            connection: _Connection | None = None
+            try:
+                connection = await self._connection_for(state.peer)
+                async with connection.write_lock:
+                    await self._write_chunks(
+                        state.peer.node_id,
+                        connection.writer,
+                        message.chunks,
+                    )
+                if not message.completion.done():
+                    message.completion.set_result(
+                        SendResult(message.frame.message_id, message.wire_bytes)
+                    )
+            except asyncio.CancelledError:
+                if not message.completion.done():
+                    message.completion.set_exception(
+                        ConnectionClosedError("Comm closed while sending message")
+                    )
+                raise
+            except (CommError, ConnectionError, OSError) as exc:
+                if connection is not None and isinstance(
+                    exc, (ConnectionError, OSError)
+                ):
+                    await self._drop_connection(connection)
+                if not message.completion.done():
+                    if isinstance(exc, CommError):
+                        message.completion.set_exception(exc)
+                    else:
+                        message.completion.set_exception(
+                            ConnectionClosedError(
+                                f"connection to {state.peer.node_id!r} failed during send"
+                            )
+                        )
+            finally:
+                message.active = False
+                async with state.queue_condition:
+                    state.pending_messages -= 1
+                    state.pending_bytes -= message.wire_bytes
+                    state.queue_condition.notify_all()
+
+    async def _write_chunks(
+        self,
+        peer_id: str,
+        writer: asyncio.StreamWriter,
+        chunks: tuple[bytes | memoryview, ...],
+    ) -> None:
+        if self._byte_scheduler is None:
+            for chunk in chunks:
+                writer.write(chunk)
+            await writer.drain()
+            return
+
+        views = tuple(memoryview(chunk) for chunk in chunks if len(chunk))
+        remaining = sum(view.nbytes for view in views)
+        chunk_index = 0
+        chunk_offset = 0
+        while remaining:
+            granted = await self._byte_scheduler.acquire(peer_id, remaining)
+            grant_remaining = granted
+            while grant_remaining:
+                view = views[chunk_index]
+                portion = min(grant_remaining, view.nbytes - chunk_offset)
+                writer.write(view[chunk_offset : chunk_offset + portion])
+                chunk_offset += portion
+                grant_remaining -= portion
+                remaining -= portion
+                if chunk_offset == view.nbytes:
+                    chunk_index += 1
+                    chunk_offset = 0
+            await writer.drain()
+
+    def _queue_is_full(self, state: _PeerState, wire_bytes: int) -> bool:
+        return (
+            state.pending_messages >= self.config.max_peer_queued_messages
+            or state.pending_bytes + wire_bytes > self.config.max_peer_queued_bytes
+        )
 
     async def _connection_for(self, peer: Peer) -> _Connection:
         state = self._states[peer.node_id]
@@ -341,6 +544,12 @@ class Comm:
         except CommError:
             if writer is not None:
                 writer.close()
+            raise
+        except asyncio.CancelledError:
+            if writer is not None:
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
             raise
 
     async def _accept_connection(

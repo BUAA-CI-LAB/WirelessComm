@@ -1,0 +1,14 @@
+local:
+  node_id: node-a
+  host: 192.0.2.10
+  bind_host: 0.0.0.0
+  port: 9000
+
+peers:
+  - node_id: node-b
+    host: 192.0.2.11
+    port: 9000
+
+comm:
+  max_peer_queued_messages: 1024
+  max_peer_queued_bytes: 134217728

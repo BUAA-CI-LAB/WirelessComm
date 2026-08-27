@@ -1,0 +1,28 @@
+controller: agx-orin
+base_port: 9500
+
+nodes:
+  - node_id: agx-orin
+    host: 192.0.2.101
+    ssh_alias: AgxOrin
+    interface: wlP1p1s0
+    workdir: /tmp/wireless_comm_test_20260827
+    python: .venv/bin/python
+    ranks: [0]
+
+  - node_id: agx-thor
+    host: 192.0.2.100
+    ssh_alias: AgxThor
+    interface: wlP1p1s0
+    workdir: /tmp/wireless_comm_test_20260827
+    python: .venv/bin/python
+    ranks: [1]
+
+ring: [0, 1]
+
+benchmark:
+  payload_sizes: [1024, 65536]
+  rounds: 5
+  warmup_rounds: 1
+  collectives: [barrier, broadcast, allgather, ring_allreduce]
+  timeout: 30

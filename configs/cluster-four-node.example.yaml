@@ -1,0 +1,44 @@
+controller: node-a
+base_port: 9400
+
+nodes:
+  - node_id: node-a
+    host: 192.0.2.101
+    ssh_alias: AgxOrin
+    interface: wlP1p1s0
+    workdir: /tmp/wireless_comm_cluster
+    python: .venv/bin/python
+    ranks: [0]
+
+  - node_id: node-b
+    host: 192.0.2.100
+    ssh_alias: AgxThor
+    interface: wlP1p1s0
+    workdir: /tmp/wireless_comm_cluster
+    python: .venv/bin/python
+    ranks: [1]
+
+  - node_id: node-c
+    host: 192.0.2.102
+    ssh_alias: WifiNodeC
+    interface: wlan0
+    workdir: /tmp/wireless_comm_cluster
+    python: .venv/bin/python
+    ranks: [2]
+
+  - node_id: node-d
+    host: 192.0.2.103
+    ssh_alias: WifiNodeD
+    interface: wlan0
+    workdir: /tmp/wireless_comm_cluster
+    python: .venv/bin/python
+    ranks: [3]
+
+ring: [0, 1, 2, 3]
+
+benchmark:
+  payload_sizes: [1024, 65536, 1048576]
+  rounds: 20
+  warmup_rounds: 3
+  collectives: [barrier, broadcast, allgather, ring_allreduce]
+  timeout: 120

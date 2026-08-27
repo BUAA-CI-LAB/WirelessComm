@@ -5,7 +5,14 @@ import dataclasses
 import socket
 import unittest
 
-from wireless_comm import Comm, CommOptions, OperationTimeoutError, Peer
+from wireless_comm import (
+    BackpressureError,
+    Comm,
+    CommConfig,
+    CommOptions,
+    OperationTimeoutError,
+    Peer,
+)
 
 try:
     import torch
@@ -124,3 +131,89 @@ class CommIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(torch.equal(received["matrix"], payload["matrix"]))
         self.assertTrue(torch.equal(received["indices"][0], payload["indices"][0]))
         self.assertEqual(metadata, {"kind": "tensor-dict"})
+
+
+class BackpressureIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.peer_a = Peer("queue-a", "127.0.0.1", unused_local_port())
+        self.peer_b = Peer("queue-b", "127.0.0.1", unused_local_port())
+        config = CommConfig(
+            max_peer_queued_messages=1,
+            max_peer_queued_bytes=1024 * 1024,
+        )
+        self.a = await Comm.create(
+            local=self.peer_a,
+            peers=[self.peer_b],
+            config=config,
+        )
+        self.b = await Comm.create(
+            local=self.peer_b,
+            peers=[self.peer_a],
+            config=config,
+        )
+
+    async def asyncTearDown(self) -> None:
+        await self.a.close()
+        await self.b.close()
+
+    async def test_fail_fast_and_wait_for_capacity(self) -> None:
+        gate = asyncio.Event()
+        original_connection_for = self.a._connection_for
+
+        async def blocked_connection_for(peer: Peer):
+            await gate.wait()
+            return await original_connection_for(peer)
+
+        self.a._connection_for = blocked_connection_for
+        first = asyncio.create_task(self.a.send("first", self.a.peer("queue-b")))
+        await self._wait_for_pending_messages(1)
+
+        with self.assertRaises(BackpressureError):
+            await self.a.send(
+                "rejected",
+                self.a.peer("queue-b"),
+                options=CommOptions(wait_for_capacity=False),
+            )
+
+        waiting = asyncio.create_task(self.a.send("second", self.a.peer("queue-b")))
+        await asyncio.sleep(0)
+        self.assertFalse(waiting.done())
+        gate.set()
+        await asyncio.gather(first, waiting)
+        self.assertEqual(
+            await self.b.recv(self.b.peer("queue-a"), CommOptions(timeout=1)),
+            ("first", None),
+        )
+        self.assertEqual(
+            await self.b.recv(self.b.peer("queue-a"), CommOptions(timeout=1)),
+            ("second", None),
+        )
+
+    async def test_message_larger_than_queue_limit_is_rejected(self) -> None:
+        with self.assertRaises(BackpressureError):
+            await self.a.send(b"x" * (1024 * 1024), self.a.peer("queue-b"))
+
+    async def test_timeout_cancels_active_send_and_releases_capacity(self) -> None:
+        gate = asyncio.Event()
+
+        async def blocked_connection_for(peer: Peer):
+            await gate.wait()
+            raise AssertionError(f"unexpected connection for {peer.node_id}")
+
+        self.a._connection_for = blocked_connection_for
+        with self.assertRaises(OperationTimeoutError):
+            await self.a.send(
+                "times-out",
+                self.a.peer("queue-b"),
+                options=CommOptions(timeout=0.01),
+            )
+        state = self.a._states["queue-b"]
+        self.assertEqual(state.pending_messages, 0)
+        self.assertEqual(state.pending_bytes, 0)
+
+    async def _wait_for_pending_messages(self, expected: int) -> None:
+        for _ in range(100):
+            if self.a._states["queue-b"].pending_messages == expected:
+                return
+            await asyncio.sleep(0)
+        self.fail(f"send queue did not reach {expected} pending messages")
