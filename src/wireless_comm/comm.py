@@ -432,9 +432,15 @@ class Comm:
                         SendResult(message.frame.message_id, message.wire_bytes)
                     )
             except asyncio.CancelledError:
+                if connection is not None:
+                    # A cancelled write may have emitted a partial frame. TCP
+                    # cannot safely carry another frame after losing alignment.
+                    await self._drop_connection(connection)
                 if not message.completion.done():
                     message.completion.set_exception(
-                        ConnectionClosedError("Comm closed while sending message")
+                        ConnectionClosedError(
+                            "connection closed after an active send was cancelled"
+                        )
                     )
                 raise
             except (CommError, ConnectionError, OSError) as exc:
