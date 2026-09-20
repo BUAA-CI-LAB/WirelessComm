@@ -100,7 +100,9 @@ For a localhost two-process check, replace the configs with
 ## Wi-Fi benchmark
 
 The benchmark combines application-level Comm measurements with system, route,
-radio, interface, and TCP diagnostics. Start the responder first:
+radio, interface, and TCP diagnostics. Two recorded studies live under
+[`reports/`](reports/): a scheduler A/B sweep and a four-node 5 GHz Wi-Fi
+profile. Start the responder first:
 
 ```bash
 python -m wireless_comm.benchmark \
